@@ -1,0 +1,105 @@
+# Set directory paths
+data_dir <- "path/to/data/"
+output_dir <- "path/to/output/"
+setwd(output_dir)
+
+# Read data: Assuming pre-processed gene matrix and group file
+gene_group <- read.table(file.path(data_dir, "gene_group.csv"), sep = ",", row.names = 1, header = TRUE, fill = TRUE)
+gene_group$TraitY <- factor(gene_group$TraitY)
+
+# Split into training and testing sets
+set.seed(123)
+train_index <- sample(nrow(gene_group), nrow(gene_group) * 0.7)
+gene_train <- gene_group[train_index, ]
+gene_test <- gene_group[-train_index, ]
+
+# Random Forest model training
+library(randomForest)
+set.seed(123)
+gene_rf <- randomForest(TraitY ~ ., data = gene_train, importance = TRUE, proximity = TRUE)
+
+# Model performance evaluation
+train_pred <- predict(gene_rf, gene_train)
+train_acc <- sum(diag(table(train_pred, gene_train$TraitY))) / nrow(gene_train)
+
+test_pred <- predict(gene_rf, gene_test)
+test_acc <- sum(diag(table(gene_test$TraitY, test_pred))) / nrow(gene_test)
+
+# Extract feature importance
+importance_df <- data.frame(importance(gene_rf))
+importance_df <- importance_df[order(importance_df$MeanDecreaseAccuracy, decreasing = TRUE), ]
+write.table(importance_df, file.path(output_dir, "gene_importance.txt"), sep = "\t", col.names = NA, quote = FALSE)
+
+# Cross-validation analysis
+set.seed(123)
+gene_train.cv <- replicate(5, rfcv(gene_train[-ncol(gene_train)], gene_train$TraitY, cv.fold = 10, step = 1.5), simplify = FALSE)
+gene_train.cv_df <- data.frame(sapply(gene_train.cv, '[[', 'error.cv'))
+gene_train.cv_df$genes <- rownames(gene_train.cv_df)
+gene_train.cv_df <- reshape2::melt(gene_train.cv_df, id = "genes")
+gene_train.cv_df$genes <- as.numeric(as.character(gene_train.cv_df$genes))
+
+# Plot cross-validation error curve
+library(ggplot2)
+library(splines)
+ggplot(gene_train.cv_df, aes(genes, value)) +
+  geom_smooth(se = FALSE, method = "glm", formula = y ~ ns(x, 6)) +
+  geom_vline(xintercept = 70) +
+  theme_minimal() +
+  labs(x = "Number of Genes", y = "Cross-validation error")
+
+# Build simplified model (select top 70 important genes)
+gene_select <- rownames(importance_df)[1:70]
+gene_train_top <- gene_train[, c(gene_select, "TraitY")]
+gene_test_top <- gene_test[, c(gene_select, "TraitY")]
+
+set.seed(123)
+gene_rf_top <- randomForest(TraitY ~ ., data = gene_train_top, importance = TRUE)
+
+# Performance evaluation (simplified model)
+train_pred_top <- predict(gene_rf_top, gene_train_top)
+test_pred_top <- predict(gene_rf_top, gene_test_top)
+train_acc_top <- sum(diag(table(train_pred_top, gene_train_top$TraitY))) / nrow(gene_train_top)
+test_acc_top <- sum(diag(table(gene_test_top$TraitY, test_pred_top))) / nrow(gene_test_top)
+
+# Plot ROC curve
+library(riskRegression)
+xb <- Score(list("RF" = gene_rf_top), TraitY ~ 1, data = gene_test_top, plots = "roc", metrics = c("auc", "brier"))
+plotROC(xb, brier.in.legend = 1L)
+
+# PCoA analysis and visualization
+library(vegan)
+top_genes <- rownames(importance_df)[1:70]
+gene_selected <- gene_group[, top_genes]
+gene_selected <- gene_selected[rowSums(gene_selected) > 0, ]
+
+gene_dist <- vegdist(gene_selected, method = "canberra")
+pcoa <- cmdscale(gene_dist, k = 2, eig = TRUE)
+pcoa_df <- as.data.frame(pcoa$points)
+colnames(pcoa_df) <- c("PCoA1", "PCoA2")
+
+# Get classification results
+full_pred <- predict(gene_rf_top, gene_group[, c(top_genes)])
+names(full_pred) <- rownames(gene_group)
+pcoa_df$Group <- as.character(full_pred[rownames(pcoa_df)])
+pcoa_df$Group <- factor(pcoa_df$Group)
+
+# Fit logistic regression and plot decision boundary
+logit_model <- glm(Group ~ PCoA1 + PCoA2, data = pcoa_df, family = binomial)
+aic_val <- AIC(logit_model)
+x_range <- seq(min(pcoa_df$PCoA1), max(pcoa_df$PCoA1), length.out = 100)
+y_range <- seq(min(pcoa_df$PCoA2), max(pcoa_df$PCoA2), length.out = 100)
+grid <- expand.grid(PCoA1 = x_range, PCoA2 = y_range)
+grid$prob <- predict(logit_model, newdata = grid, type = "response")
+
+# Plot PCA and decision boundary
+ggplot(pcoa_df, aes(x = PCoA1, y = PCoA2, color = Group)) +
+  geom_point(aes(shape = Group), size = 3, alpha = 0.5) +
+  labs(title = paste("RF Classifier (AIC:", round(aic_val, 2), ")"),
+       x = paste0("PCoA1 (", round(pcoa$eig[1]/sum(pcoa$eig) * 100, 2), "%)"),
+       y = paste0("PCoA2 (", round(pcoa$eig[2]/sum(pcoa$eig) * 100, 2), "%)")) +
+  theme_bw() +
+  scale_color_manual(values = c("1" = "#CC4D31", "0" = "#EBAA20")) +
+  scale_shape_manual(values = c("1" = 16, "0" = 17))
+
+# Optional save the plot
+ggsave(file.path(output_dir, "rf_classifier_plot.pdf"), width = 5, height = 5)
